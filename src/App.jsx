@@ -130,7 +130,6 @@ function stepDate(date, unit, interval) {
 const REPEAT_UNITS = [
   { value: "day", label: "day" },
   { value: "week", label: "week" },
-  { value: "month", label: "month" },
 ];
 
 const REPEAT_OCCURRENCE_COUNT = 20; // how many future occurrences to generate at once
@@ -228,6 +227,11 @@ export default function App() {
   const [draft, setDraft] = useState(null);
   const [hexText, setHexText] = useState("");
   const [customColors, setCustomColors] = useState(() => loadCustomColors());
+  // Custom in-app dialog replaces window.confirm/alert, which can silently fail
+  // to appear when this app is running as an "Add to Home Screen" standalone app.
+  const [dialog, setDialog] = useState(null); // { message, mode: 'confirm' | 'alert', onConfirm }
+  const askConfirm = (message, onConfirm) => setDialog({ message, mode: "confirm", onConfirm });
+  const showAlert = (message) => setDialog({ message, mode: "alert" });
   const gridRef = useRef(null);
   const dragState = useRef(null);
   const [dragPreview, setDragPreview] = useState(null); // {id, date, startMin}
@@ -286,20 +290,21 @@ export default function App() {
         const parsed = JSON.parse(reader.result);
         const importedBlocks = Array.isArray(parsed.blocks) ? parsed.blocks : null;
         if (!importedBlocks) {
-          alert("This file doesn't look like a Blockweek backup.");
+          showAlert("This file doesn't look like a Blockweek backup.");
           return;
         }
-        const confirmed = window.confirm(
-          `Restore ${importedBlocks.length} block${importedBlocks.length === 1 ? "" : "s"} from this backup? This will replace everything currently in your week.`
+        askConfirm(
+          `Restore ${importedBlocks.length} block${importedBlocks.length === 1 ? "" : "s"} from this backup? This will replace everything currently in your week.`,
+          () => {
+            setBlocks(importedBlocks);
+            if (Array.isArray(parsed.customColors)) {
+              setCustomColors(parsed.customColors);
+              saveCustomColors(parsed.customColors);
+            }
+          }
         );
-        if (!confirmed) return;
-        setBlocks(importedBlocks);
-        if (Array.isArray(parsed.customColors)) {
-          setCustomColors(parsed.customColors);
-          saveCustomColors(parsed.customColors);
-        }
       } catch (err) {
-        alert("Couldn't read that file — make sure it's a Blockweek backup JSON file.");
+        showAlert("Couldn't read that file — make sure it's a Blockweek backup JSON file.");
       }
     };
     reader.readAsText(file);
@@ -494,9 +499,14 @@ export default function App() {
     setDraft(null);
   };
 
-  const enableRepeat = () => {
+  // Regenerates this occurrence's future series from scratch using the given overrides
+  // (e.g. a just-changed interval or unit). Removes any previously generated future
+  // occurrences of this series so stale ones from an old interval don't linger, but
+  // leaves past occurrences untouched.
+  const regenerateSeries = (overrides = {}) => {
     if (!draft) return;
-    const baseDraft = draft.title && draft.title.trim() ? draft : { ...draft, title: "Untitled block" };
+    const merged = { ...draft, ...overrides };
+    const baseDraft = merged.title && merged.title.trim() ? merged : { ...merged, title: "Untitled block" };
     const interval = Math.max(1, Number(baseDraft.repeatInterval) || 1);
     const unit = baseDraft.repeatUnit || "week";
     const sid = baseDraft.seriesId || `series_${Date.now()}_${idCounter++}`;
@@ -516,9 +526,14 @@ export default function App() {
       });
     }
     const updatedSelf = { ...baseDraft, seriesId: sid, repeatEnabled: true, repeatInterval: interval, repeatUnit: unit };
+    const thisDate = baseDraft.date;
     setBlocks((prev) => {
-      const withoutSelf = prev.filter((b) => b.id !== draft.id);
-      return [...withoutSelf, updatedSelf, ...futureInstances];
+      const kept = prev.filter((b) => {
+        if (b.id === draft.id) return false; // this occurrence, re-added below as updatedSelf
+        if (sid && b.seriesId === sid && b.date >= thisDate) return false; // stale future occurrences from old interval
+        return true;
+      });
+      return [...kept, updatedSelf, ...futureInstances];
     });
     setDraft(updatedSelf);
   };
@@ -528,35 +543,17 @@ export default function App() {
     setDraft({ ...draft, repeatEnabled: false, seriesId: null });
   };
 
-  // Push this occurrence's shared fields (title, time, duration, color, notes) onto every
-  // future occurrence in the same series, without touching each one's own date.
-  const applySeriesUpdate = () => {
-    if (!draft || !draft.seriesId) return;
-    const confirmed = window.confirm(
-      "Apply these changes (title, time, duration, color, notes) to this and every future occurrence in the series?"
-    );
-    if (!confirmed) return;
-    const seriesId = draft.seriesId;
-    const thisDate = draft.date;
-    const { title, startMin, durMin, color, notes } = draft;
-    setBlocks((prev) =>
-      prev.map((b) => {
-        if (b.seriesId !== seriesId || b.date < thisDate) return b;
-        return { ...b, title, startMin, durMin, color, notes };
-      })
-    );
-  };
-
   const deleteSeries = () => {
     if (!draft || !draft.seriesId) return;
     const seriesId = draft.seriesId;
-    const confirmed = window.confirm(
-      "Delete this event and every future occurrence in its weekly series? This can't be undone."
+    askConfirm(
+      "Delete this event and every future occurrence in its repeating series? This can't be undone.",
+      () => {
+        setBlocks((prev) => prev.filter((b) => b.seriesId !== seriesId));
+        setEditing(null);
+        setDraft(null);
+      }
     );
-    if (!confirmed) return;
-    setBlocks((prev) => prev.filter((b) => b.seriesId !== seriesId));
-    setEditing(null);
-    setDraft(null);
   };
 
   const addCustomColor = (hex) => {
@@ -812,7 +809,7 @@ export default function App() {
                 type="checkbox"
                 checked={!!draft.repeatEnabled}
                 onChange={(e) => {
-                  if (e.target.checked) enableRepeat();
+                  if (e.target.checked) setDraft({ ...draft, repeatEnabled: true });
                   else disableRepeat();
                 }}
               />
@@ -845,10 +842,14 @@ export default function App() {
                     ))}
                   </select>
                 </div>
+                <button className="save-repeat-btn" onClick={() => regenerateSeries()}>
+                  <RefreshCw size={14} />
+                  {draft.seriesId ? "Save repeat settings" : "Create repeating series"}
+                </button>
                 <div className="repeat-hint">
-                  Creates the next {REPEAT_OCCURRENCE_COUNT} occurrences right away. Editing this one only
-                  changes this occurrence — use "Update series" below to push title, time, duration, color,
-                  and notes to this and every future occurrence at once.
+                  {draft.seriesId
+                    ? `Generates the next ${REPEAT_OCCURRENCE_COUNT} occurrences and applies this occurrence's title, time, duration, color, and notes to all of them. Tap the button above any time you change the interval, unit, or these details, to push the update through.`
+                    : `Set your interval and unit, then tap the button above to generate the next ${REPEAT_OCCURRENCE_COUNT} occurrences.`}
                 </div>
               </>
             )}
@@ -956,16 +957,10 @@ export default function App() {
                   Delete
                 </button>
                 {draft.seriesId && (
-                  <>
-                    <button className="danger-btn" onClick={deleteSeries}>
-                      <Trash2 size={16} />
-                      Delete series
-                    </button>
-                    <button className="duplicate-btn" onClick={applySeriesUpdate}>
-                      <RefreshCw size={16} />
-                      Update series
-                    </button>
-                  </>
+                  <button className="danger-btn" onClick={deleteSeries}>
+                    <Trash2 size={16} />
+                    Delete series
+                  </button>
                 )}
                 <button className="duplicate-btn" onClick={duplicateDraft}>
                   <Copy size={16} />
@@ -973,6 +968,33 @@ export default function App() {
                 </button>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {dialog && (
+        <div className="modal-overlay" onClick={() => setDialog(null)}>
+          <div className="dialog-box" onClick={(e) => e.stopPropagation()}>
+            <div className="dialog-message">{dialog.message}</div>
+            <div className="dialog-actions">
+              {dialog.mode === "confirm" && (
+                <button
+                  className="ghost-btn"
+                  onClick={() => setDialog(null)}
+                >
+                  Cancel
+                </button>
+              )}
+              <button
+                className="primary-btn"
+                onClick={() => {
+                  if (dialog.mode === "confirm" && dialog.onConfirm) dialog.onConfirm();
+                  setDialog(null);
+                }}
+              >
+                {dialog.mode === "confirm" ? "Confirm" : "OK"}
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1248,6 +1270,25 @@ const CSS = `
   @media (min-width: 560px) {
     .modal { border-radius: 16px; }
   }
+  .dialog-box {
+    background: var(--paper);
+    width: calc(100% - 32px);
+    max-width: 360px;
+    border-radius: 14px;
+    padding: 20px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.25);
+  }
+  .dialog-message {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--ink);
+  }
+  .dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 18px;
+  }
   .modal-header {
     display: flex;
     align-items: center;
@@ -1350,6 +1391,23 @@ const CSS = `
     flex: 1;
     cursor: pointer;
   }
+  .save-repeat-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+    margin-top: 10px;
+    padding: 9px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--ink);
+    background: var(--ink);
+    color: var(--paper);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .save-repeat-btn:hover { background: var(--accent); border-color: var(--accent); }
 
   .color-picker-row {
     display: flex;
