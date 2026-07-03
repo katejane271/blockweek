@@ -1,5 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
-import { Plus, X, ChevronLeft, ChevronRight, Trash2 } from "lucide-react";
+import { Plus, X, ChevronLeft, ChevronRight, Trash2, Copy, ExternalLink, Download, Upload, RefreshCw } from "lucide-react";
 
 // ---------- constants ----------
 const DAY_START = 6; // 6am
@@ -8,14 +8,66 @@ const HOUR_HEIGHT = 64; // px per hour
 const SNAP_MIN = 15; // snap granularity in minutes
 const PX_PER_MIN = HOUR_HEIGHT / 60;
 
-const COLORS = [
-  { name: "ink", bg: "#2B3A4A", text: "#F4F2EC" },
-  { name: "rust", bg: "#B5573A", text: "#F4F2EC" },
-  { name: "moss", bg: "#5C6B4F", text: "#F4F2EC" },
-  { name: "ochre", bg: "#C08A2E", text: "#2B241A" },
-  { name: "slate", bg: "#5E6B73", text: "#F4F2EC" },
-  { name: "plum", bg: "#6B4C6B", text: "#F4F2EC" },
+const PRESET_COLORS = [
+  "#2B3A4A", // ink
+  "#B5573A", // rust
+  "#5C6B4F", // moss
+  "#C08A2E", // ochre
+  "#5E6B73", // slate
+  "#6B4C6B", // plum
 ];
+
+// Map old-style preset names (from earlier versions) to hex, for backward compatibility
+const LEGACY_NAME_TO_HEX = {
+  ink: "#2B3A4A",
+  rust: "#B5573A",
+  moss: "#5C6B4F",
+  ochre: "#C08A2E",
+  slate: "#5E6B73",
+  plum: "#6B4C6B",
+};
+
+function resolveColor(color) {
+  if (!color) return PRESET_COLORS[0];
+  if (LEGACY_NAME_TO_HEX[color]) return LEGACY_NAME_TO_HEX[color];
+  return color;
+}
+
+// Pick readable text color (near-black or near-white) based on background luminance
+function textColorFor(hex) {
+  const c = hex.replace("#", "");
+  if (c.length !== 6) return "#F4F2EC";
+  const r = parseInt(c.slice(0, 2), 16);
+  const g = parseInt(c.slice(2, 4), 16);
+  const b = parseInt(c.slice(4, 6), 16);
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.6 ? "#2B241A" : "#F4F2EC";
+}
+
+function isValidHex(hex) {
+  return /^#[0-9A-Fa-f]{6}$/.test(hex);
+}
+
+// Pull out any URLs typed in free text (matches http(s):// links and bare www. links)
+const URL_REGEX = /(https?:\/\/[^\s]+)|(www\.[^\s]+\.[^\s]+)/gi;
+function extractLinks(text) {
+  if (!text) return [];
+  const matches = text.match(URL_REGEX) || [];
+  const seen = new Set();
+  const links = [];
+  for (let raw of matches) {
+    // trim common trailing punctuation that isn't part of the URL
+    const cleaned = raw.replace(/[),.;!?]+$/, "");
+    const href = cleaned.startsWith("http") ? cleaned : `https://${cleaned}`;
+    if (!seen.has(href)) {
+      seen.add(href);
+      let label = cleaned.replace(/^https?:\/\//, "").replace(/^www\./, "");
+      if (label.length > 34) label = label.slice(0, 34) + "…";
+      links.push({ href, label });
+    }
+  }
+  return links;
+}
 
 function pad(n) {
   return n.toString().padStart(2, "0");
@@ -30,14 +82,29 @@ function fmtTime(totalMin) {
   return `${h12}:${pad(m)} ${ampm}`;
 }
 
+// Compact "11AM" style label for the hour gutter (no minutes, no space, no colon)
+function fmtHourCompact(hour) {
+  let h12 = hour % 12;
+  if (h12 === 0) h12 = 12;
+  const suffix = hour >= 12 ? "PM" : "AM";
+  return `${h12}${suffix}`;
+}
+
 function isoDate(d) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+// Parse a "YYYY-MM-DD" string as a local date (avoids UTC-parsing off-by-one issues)
+function parseIsoDate(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
 function startOfWeek(date) {
   const d = new Date(date);
-  const day = d.getDay(); // 0 = Sunday
-  d.setDate(d.getDate() - day);
+  const day = d.getDay(); // 0 = Sunday ... 6 = Saturday
+  const diffToMonday = (day + 6) % 7; // 0 when day is already Monday
+  d.setDate(d.getDate() - diffToMonday);
   d.setHours(0, 0, 0, 0);
   return d;
 }
@@ -48,6 +115,27 @@ function addDays(date, n) {
   return d;
 }
 
+function addMonths(date, n) {
+  const d = new Date(date);
+  d.setMonth(d.getMonth() + n);
+  return d;
+}
+
+function stepDate(date, unit, interval) {
+  if (unit === "day") return addDays(date, interval);
+  if (unit === "month") return addMonths(date, interval);
+  return addDays(date, interval * 7); // week (default)
+}
+
+const REPEAT_UNITS = [
+  { value: "day", label: "day" },
+  { value: "week", label: "week" },
+  { value: "month", label: "month" },
+];
+
+const REPEAT_OCCURRENCE_COUNT = 20; // how many future occurrences to generate at once
+
+
 const WEEKDAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 let idCounter = 1;
@@ -57,6 +145,25 @@ function newId() {
 
 // ---------- storage ----------
 const STORAGE_KEY = "blockweek-blocks-v1";
+const CUSTOM_COLORS_KEY = "blockweek-custom-colors-v1";
+
+function loadCustomColors() {
+  try {
+    const raw = localStorage.getItem(CUSTOM_COLORS_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    // ignore
+  }
+  return [];
+}
+
+function saveCustomColors(colors) {
+  try {
+    localStorage.setItem(CUSTOM_COLORS_KEY, JSON.stringify(colors));
+  } catch (e) {
+    // ignore
+  }
+}
 
 function persistLoad() {
   try {
@@ -119,6 +226,8 @@ export default function App() {
   });
   const [editing, setEditing] = useState(null); // block being edited, or "new"
   const [draft, setDraft] = useState(null);
+  const [hexText, setHexText] = useState("");
+  const [customColors, setCustomColors] = useState(() => loadCustomColors());
   const gridRef = useRef(null);
   const dragState = useRef(null);
   const [dragPreview, setDragPreview] = useState(null); // {id, date, startMin}
@@ -142,6 +251,60 @@ export default function App() {
   const goToday = () => setWeekStart(startOfWeek(new Date()));
   const goPrevWeek = () => setWeekStart((w) => addDays(w, -7));
   const goNextWeek = () => setWeekStart((w) => addDays(w, 7));
+
+  // ---- backup: export / import ----
+  const fileInputRef = useRef(null);
+
+  const exportBackup = () => {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      blocks,
+      customColors,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const dateStr = isoDate(new Date());
+    a.href = url;
+    a.download = `blockweek-backup-${dateStr}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const triggerImport = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleImportFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        const importedBlocks = Array.isArray(parsed.blocks) ? parsed.blocks : null;
+        if (!importedBlocks) {
+          alert("This file doesn't look like a Blockweek backup.");
+          return;
+        }
+        const confirmed = window.confirm(
+          `Restore ${importedBlocks.length} block${importedBlocks.length === 1 ? "" : "s"} from this backup? This will replace everything currently in your week.`
+        );
+        if (!confirmed) return;
+        setBlocks(importedBlocks);
+        if (Array.isArray(parsed.customColors)) {
+          setCustomColors(parsed.customColors);
+          saveCustomColors(parsed.customColors);
+        }
+      } catch (err) {
+        alert("Couldn't read that file — make sure it's a Blockweek backup JSON file.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = ""; // allow re-importing the same filename later
+  };
 
   const snapMin = (min) => Math.round(min / SNAP_MIN) * SNAP_MIN;
 
@@ -257,25 +420,52 @@ export default function App() {
       title: "",
       startMin: hour * 60,
       durMin: 60,
-      color: COLORS[Math.floor(Math.random() * COLORS.length)].name,
+      color: PRESET_COLORS[Math.floor(Math.random() * PRESET_COLORS.length)],
       notes: "",
+      repeatEnabled: false,
+      repeatInterval: 1,
+      repeatUnit: "week",
+      seriesId: null,
     };
     setDraft(b);
+    setHexText(resolveColor(b.color));
     setEditing("new");
   };
 
   const openEdit = (block) => {
     setDraft({ ...block });
+    setHexText(resolveColor(block.color));
     setEditing(block.id);
   };
 
-  const saveDraft = () => {
-    if (!draft.title.trim()) draft.title = "Untitled block";
+  const upsertBlock = useCallback((b) => {
+    setBlocks((prev) => {
+      const exists = prev.some((x) => x.id === b.id);
+      if (exists) return prev.map((x) => (x.id === b.id ? b : x));
+      return [...prev, b];
+    });
+  }, []);
+
+  // Autosave: sync every field change straight into the blocks list as you type.
+  // A brand-new block only gets created once it has a title, so accidental empty
+  // taps don't litter the week with blank entries.
+  useEffect(() => {
+    if (!draft) return;
+    const titleFilled = draft.title && draft.title.trim() !== "";
     setBlocks((prev) => {
       const exists = prev.some((b) => b.id === draft.id);
       if (exists) return prev.map((b) => (b.id === draft.id ? draft : b));
-      return [...prev, draft];
+      if (titleFilled) return [...prev, draft];
+      return prev;
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft]);
+
+  const closeModal = () => {
+    if (draft) {
+      const finalTitle = draft.title && draft.title.trim() ? draft.title : "Untitled block";
+      upsertBlock({ ...draft, title: finalTitle });
+    }
     setEditing(null);
     setDraft(null);
   };
@@ -284,6 +474,113 @@ export default function App() {
     setBlocks((prev) => prev.filter((b) => b.id !== draft.id));
     setEditing(null);
     setDraft(null);
+  };
+
+  const duplicateDraft = () => {
+    const dayEndMin = DAY_END * 60 + 60;
+    let newStart = draft.startMin + 60; // offset by an hour so it doesn't sit exactly on top
+    if (newStart + draft.durMin > dayEndMin) {
+      newStart = Math.max(DAY_START * 60, draft.startMin - 60);
+    }
+    const copy = {
+      ...draft,
+      id: newId(),
+      startMin: newStart,
+      repeatEnabled: false,
+      seriesId: null,
+    };
+    setBlocks((prev) => [...prev, copy]);
+    setEditing(null);
+    setDraft(null);
+  };
+
+  const enableRepeat = () => {
+    if (!draft) return;
+    const baseDraft = draft.title && draft.title.trim() ? draft : { ...draft, title: "Untitled block" };
+    const interval = Math.max(1, Number(baseDraft.repeatInterval) || 1);
+    const unit = baseDraft.repeatUnit || "week";
+    const sid = baseDraft.seriesId || `series_${Date.now()}_${idCounter++}`;
+    const baseDate = parseIsoDate(baseDraft.date);
+    const futureInstances = [];
+    let cursor = baseDate;
+    for (let i = 1; i <= REPEAT_OCCURRENCE_COUNT; i++) {
+      cursor = stepDate(cursor, unit, interval);
+      futureInstances.push({
+        ...baseDraft,
+        id: newId(),
+        date: isoDate(cursor),
+        seriesId: sid,
+        repeatEnabled: true,
+        repeatInterval: interval,
+        repeatUnit: unit,
+      });
+    }
+    const updatedSelf = { ...baseDraft, seriesId: sid, repeatEnabled: true, repeatInterval: interval, repeatUnit: unit };
+    setBlocks((prev) => {
+      const withoutSelf = prev.filter((b) => b.id !== draft.id);
+      return [...withoutSelf, updatedSelf, ...futureInstances];
+    });
+    setDraft(updatedSelf);
+  };
+
+  const disableRepeat = () => {
+    if (!draft) return;
+    setDraft({ ...draft, repeatEnabled: false, seriesId: null });
+  };
+
+  // Push this occurrence's shared fields (title, time, duration, color, notes) onto every
+  // future occurrence in the same series, without touching each one's own date.
+  const applySeriesUpdate = () => {
+    if (!draft || !draft.seriesId) return;
+    const confirmed = window.confirm(
+      "Apply these changes (title, time, duration, color, notes) to this and every future occurrence in the series?"
+    );
+    if (!confirmed) return;
+    const seriesId = draft.seriesId;
+    const thisDate = draft.date;
+    const { title, startMin, durMin, color, notes } = draft;
+    setBlocks((prev) =>
+      prev.map((b) => {
+        if (b.seriesId !== seriesId || b.date < thisDate) return b;
+        return { ...b, title, startMin, durMin, color, notes };
+      })
+    );
+  };
+
+  const deleteSeries = () => {
+    if (!draft || !draft.seriesId) return;
+    const seriesId = draft.seriesId;
+    const confirmed = window.confirm(
+      "Delete this event and every future occurrence in its weekly series? This can't be undone."
+    );
+    if (!confirmed) return;
+    setBlocks((prev) => prev.filter((b) => b.seriesId !== seriesId));
+    setEditing(null);
+    setDraft(null);
+  };
+
+  const addCustomColor = (hex) => {
+    if (!isValidHex(hex)) return;
+    setCustomColors((prev) => {
+      const normalized = hex.toUpperCase();
+      if (
+        PRESET_COLORS.some((c) => c.toUpperCase() === normalized) ||
+        prev.some((c) => c.toUpperCase() === normalized)
+      ) {
+        return prev; // already exists, no duplicate
+      }
+      const next = [...prev, normalized];
+      saveCustomColors(next);
+      return next;
+    });
+  };
+
+  const removeCustomColor = (hex) => {
+    setCustomColors((prev) => {
+      const next = prev.filter((c) => c !== hex);
+      saveCustomColors(next);
+      return next;
+    });
   };
 
   const today = new Date();
@@ -298,21 +595,38 @@ export default function App() {
           <span className="brand-mark">◱</span>
           <span className="brand-name">Blockweek</span>
         </div>
-        <div className="week-nav">
-          <button className="nav-btn" onClick={goPrevWeek} aria-label="Previous week">
-            <ChevronLeft size={18} />
-          </button>
-          <button className="today-btn" onClick={goToday}>
-            Today
-          </button>
-          <button className="nav-btn" onClick={goNextWeek} aria-label="Next week">
-            <ChevronRight size={18} />
-          </button>
+        <div className="right-controls">
           <span className="week-range">
             {days[0].toLocaleDateString(undefined, { month: "short", day: "numeric" })}
             {" – "}
             {days[6].toLocaleDateString(undefined, { month: "short", day: "numeric" })}
           </span>
+          <div className="week-nav">
+            <button className="nav-btn" onClick={goPrevWeek} aria-label="Previous week">
+              <ChevronLeft size={18} />
+            </button>
+            <button className="today-btn" onClick={goToday}>
+              Today
+            </button>
+            <button className="nav-btn" onClick={goNextWeek} aria-label="Next week">
+              <ChevronRight size={18} />
+            </button>
+          </div>
+          <div className="backup-controls">
+            <button className="nav-btn" onClick={exportBackup} aria-label="Download backup" title="Download backup">
+              <Download size={16} />
+            </button>
+            <button className="nav-btn" onClick={triggerImport} aria-label="Restore from backup" title="Restore from backup">
+              <Upload size={16} />
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/json"
+              onChange={handleImportFile}
+              style={{ display: "none" }}
+            />
+          </div>
         </div>
       </header>
 
@@ -341,7 +655,7 @@ export default function App() {
             <div className="time-gutter">
               {hours.map((h) => (
                 <div key={h} className="time-label" style={{ height: HOUR_HEIGHT }}>
-                  {fmtTime(h * 60)}
+                  {fmtHourCompact(h)}
                 </div>
               ))}
             </div>
@@ -384,7 +698,8 @@ export default function App() {
                     const startMin = usingPreview ? dragPreview.startMin : b.startMin;
                     const top = (startMin - DAY_START * 60) * PX_PER_MIN;
                     const height = Math.max(20, b.durMin * PX_PER_MIN);
-                    const color = COLORS.find((c) => c.name === b.color) || COLORS[0];
+                    const bgHex = resolveColor(b.color);
+                    const color = { bg: bgHex, text: textColorFor(bgHex) };
                     return (
                       <div
                         key={b.id}
@@ -434,13 +749,13 @@ export default function App() {
       </button>
 
       {editing && draft && (
-        <div className="modal-overlay" onClick={() => { setEditing(null); setDraft(null); }}>
+        <div className="modal-overlay" onClick={closeModal}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
               <span>{editing === "new" ? "New block" : "Edit block"}</span>
               <button
                 className="icon-btn"
-                onClick={() => { setEditing(null); setDraft(null); }}
+                onClick={closeModal}
               >
                 <X size={18} />
               </button>
@@ -492,46 +807,172 @@ export default function App() {
               </div>
             </div>
 
+            <label className="repeat-toggle">
+              <input
+                type="checkbox"
+                checked={!!draft.repeatEnabled}
+                onChange={(e) => {
+                  if (e.target.checked) enableRepeat();
+                  else disableRepeat();
+                }}
+              />
+              <span>Repeats</span>
+            </label>
+            {draft.repeatEnabled && (
+              <>
+                <div className="repeat-interval-row">
+                  <span className="repeat-interval-label">every</span>
+                  <input
+                    className="text-input repeat-interval-input"
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={draft.repeatInterval}
+                    onChange={(e) =>
+                      setDraft({ ...draft, repeatInterval: Math.max(1, Number(e.target.value) || 1) })
+                    }
+                  />
+                  <select
+                    className="text-input repeat-unit-select"
+                    value={draft.repeatUnit}
+                    onChange={(e) => setDraft({ ...draft, repeatUnit: e.target.value })}
+                  >
+                    {REPEAT_UNITS.map((u) => (
+                      <option key={u.value} value={u.value}>
+                        {u.label}
+                        {Number(draft.repeatInterval) === 1 ? "" : "s"}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="repeat-hint">
+                  Creates the next {REPEAT_OCCURRENCE_COUNT} occurrences right away. Editing this one only
+                  changes this occurrence — use "Update series" below to push title, time, duration, color,
+                  and notes to this and every future occurrence at once.
+                </div>
+              </>
+            )}
+
             <label className="field-label">Notes</label>
             <textarea
               className="text-input notes-input"
               value={draft.notes || ""}
               onChange={(e) => setDraft({ ...draft, notes: e.target.value })}
-              placeholder="What do you need to do here? Any details worth remembering…"
+              placeholder="What do you need to do here? Paste a link and it'll show below as a tap-through shortcut."
               rows={4}
             />
+            {extractLinks(draft.notes).length > 0 && (
+              <div className="link-chip-row">
+                {extractLinks(draft.notes).map((link) => (
+                  <a
+                    key={link.href}
+                    className="link-chip"
+                    href={link.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    <ExternalLink size={12} />
+                    {link.label}
+                  </a>
+                ))}
+              </div>
+            )}
 
             <label className="field-label">Color</label>
+            <div className="color-picker-row">
+              <input
+                className="color-wheel"
+                type="color"
+                value={isValidHex(hexText) ? hexText : resolveColor(draft.color)}
+                onChange={(e) => {
+                  const hex = e.target.value;
+                  setHexText(hex);
+                  setDraft({ ...draft, color: hex });
+                }}
+                aria-label="Pick a custom color"
+              />
+              <input
+                className="text-input hex-input"
+                type="text"
+                value={hexText}
+                onChange={(e) => {
+                  let val = e.target.value;
+                  if (val && !val.startsWith("#")) val = "#" + val;
+                  setHexText(val);
+                  if (isValidHex(val)) {
+                    setDraft({ ...draft, color: val });
+                  }
+                }}
+                placeholder="#2B3A4A"
+                maxLength={7}
+                spellCheck={false}
+              />
+              <button
+                className="save-color-btn"
+                onClick={() => addCustomColor(isValidHex(hexText) ? hexText : resolveColor(draft.color))}
+                title="Save this color to your presets"
+                aria-label="Save this color to your presets"
+              >
+                <Plus size={16} />
+              </button>
+            </div>
             <div className="color-row">
-              {COLORS.map((c) => (
+              {PRESET_COLORS.map((hex) => (
                 <button
-                  key={c.name}
-                  className={"color-swatch" + (draft.color === c.name ? " is-selected" : "")}
-                  style={{ background: c.bg }}
-                  onClick={() => setDraft({ ...draft, color: c.name })}
-                  aria-label={c.name}
+                  key={hex}
+                  className={"color-swatch" + (resolveColor(draft.color).toLowerCase() === hex.toLowerCase() ? " is-selected" : "")}
+                  style={{ background: hex }}
+                  onClick={() => { setDraft({ ...draft, color: hex }); setHexText(hex); }}
+                  aria-label={hex}
                 />
               ))}
+              {customColors.map((hex) => (
+                <div key={hex} className="color-swatch-wrap">
+                  <button
+                    className={"color-swatch" + (resolveColor(draft.color).toLowerCase() === hex.toLowerCase() ? " is-selected" : "")}
+                    style={{ background: hex }}
+                    onClick={() => { setDraft({ ...draft, color: hex }); setHexText(hex); }}
+                    aria-label={hex}
+                  />
+                  <button
+                    className="color-swatch-remove"
+                    onClick={(e) => { e.stopPropagation(); removeCustomColor(hex); }}
+                    aria-label={`Remove ${hex} from presets`}
+                    title="Remove from presets"
+                  >
+                    <X size={10} />
+                  </button>
+                </div>
+              ))}
             </div>
+            {customColors.length === 0 && (
+              <div className="color-hint">Pick a color above, then tap + to save it here as a preset.</div>
+            )}
 
-            <div className="modal-actions">
-              {editing !== "new" && (
+            {editing !== "new" && (
+              <div className="modal-actions">
                 <button className="danger-btn" onClick={deleteDraft}>
                   <Trash2 size={16} />
                   Delete
                 </button>
-              )}
-              <div className="spacer" />
-              <button
-                className="ghost-btn"
-                onClick={() => { setEditing(null); setDraft(null); }}
-              >
-                Cancel
-              </button>
-              <button className="primary-btn" onClick={saveDraft}>
-                Save
-              </button>
-            </div>
+                {draft.seriesId && (
+                  <>
+                    <button className="danger-btn" onClick={deleteSeries}>
+                      <Trash2 size={16} />
+                      Delete series
+                    </button>
+                    <button className="duplicate-btn" onClick={applySeriesUpdate}>
+                      <RefreshCw size={16} />
+                      Update series
+                    </button>
+                  </>
+                )}
+                <button className="duplicate-btn" onClick={duplicateDraft}>
+                  <Copy size={16} />
+                  Duplicate
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -579,7 +1020,15 @@ const CSS = `
     letter-spacing: 0.02em;
   }
 
+  .right-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
   .week-nav { display: flex; align-items: center; gap: 6px; }
+  .backup-controls { display: flex; align-items: center; gap: 6px; }
   .nav-btn, .today-btn, .icon-btn {
     background: transparent;
     border: 1px solid var(--paper-line);
@@ -598,7 +1047,6 @@ const CSS = `
     font-family: 'JetBrains Mono', 'SF Mono', monospace;
     font-size: 12px;
     color: var(--ink-soft);
-    margin-left: 4px;
   }
 
   .grid-scroll {
@@ -610,7 +1058,7 @@ const CSS = `
 
   .day-headers {
     display: grid;
-    grid-template-columns: 56px repeat(7, 1fr);
+    grid-template-columns: 44px repeat(7, 1fr);
     position: sticky;
     top: 0;
     background: var(--paper);
@@ -623,27 +1071,27 @@ const CSS = `
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: 8px 0;
+    padding: 5px 0;
     border-right: 1px solid var(--paper-line);
   }
   .day-header.is-today { background: var(--today-tint); }
   .dh-weekday {
-    font-size: 10px;
+    font-size: 9px;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.06em;
     color: var(--ink-soft);
   }
   .dh-num {
     font-family: 'JetBrains Mono', 'SF Mono', monospace;
-    font-size: 16px;
+    font-size: 13px;
     font-weight: 600;
-    margin-top: 2px;
+    margin-top: 1px;
   }
   .day-header.is-today .dh-num { color: var(--accent); }
 
   .grid-body {
     display: grid;
-    grid-template-columns: 56px repeat(7, 1fr);
+    grid-template-columns: 44px repeat(7, 1fr);
     position: relative;
   }
   .time-gutter { border-right: 1px solid var(--paper-line); }
@@ -653,7 +1101,9 @@ const CSS = `
     color: var(--ink-soft);
     text-align: right;
     padding-right: 8px;
-    transform: translateY(-6px);
+    padding-top: 3px;
+    white-space: nowrap;
+    overflow: hidden;
   }
 
   .day-col {
@@ -724,11 +1174,11 @@ const CSS = `
   }
   .note-dot {
     flex-shrink: 0;
-    width: 5px;
-    height: 5px;
+    width: 6px;
+    height: 6px;
     border-radius: 50%;
     background: currentColor;
-    opacity: 0.75;
+    opacity: 0.4;
   }
   .block-time {
     font-family: 'JetBrains Mono', 'SF Mono', monospace;
@@ -833,11 +1283,142 @@ const CSS = `
     line-height: 1.4;
     font-family: inherit;
   }
+  .link-chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .link-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 10px;
+    border-radius: 999px;
+    background: #E8E4D6;
+    color: var(--ink);
+    font-size: 12px;
+    font-weight: 500;
+    text-decoration: none;
+    max-width: 100%;
+    overflow: hidden;
+  }
+  .link-chip:hover { background: var(--accent); color: var(--paper); }
 
   .field-row { display: flex; gap: 10px; }
   .field-col { flex: 1; min-width: 0; }
 
-  .color-row { display: flex; gap: 8px; }
+  .repeat-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 14px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ink);
+    cursor: pointer;
+  }
+  .repeat-toggle input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .repeat-hint {
+    font-size: 11px;
+    color: var(--ink-soft);
+    line-height: 1.4;
+    margin-top: 6px;
+  }
+  .repeat-interval-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .repeat-interval-label {
+    font-size: 13px;
+    color: var(--ink-soft);
+    flex-shrink: 0;
+  }
+  .repeat-interval-input {
+    width: 56px;
+    flex-shrink: 0;
+    text-align: center;
+  }
+  .repeat-unit-select {
+    flex: 1;
+    cursor: pointer;
+  }
+
+  .color-picker-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .color-wheel {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 40px;
+    height: 40px;
+    border: 1px solid var(--paper-line);
+    border-radius: 8px;
+    padding: 0;
+    cursor: pointer;
+    background: none;
+    flex-shrink: 0;
+  }
+  .color-wheel::-webkit-color-swatch-wrapper { padding: 3px; }
+  .color-wheel::-webkit-color-swatch { border: none; border-radius: 6px; }
+  .hex-input {
+    flex: 1;
+    font-family: 'JetBrains Mono', 'SF Mono', monospace;
+    text-transform: uppercase;
+  }
+  .color-row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .save-color-btn {
+    flex-shrink: 0;
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    border: 1px dashed var(--paper-line);
+    background: transparent;
+    color: var(--ink-soft);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
+  .save-color-btn:hover { background: #E8E4D6; color: var(--ink); border-color: var(--ink-soft); }
+  .color-swatch-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+  .color-swatch-remove {
+    position: absolute;
+    top: -5px;
+    right: -5px;
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    background: var(--ink);
+    color: var(--paper);
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 0;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  .color-swatch-wrap:hover .color-swatch-remove { opacity: 1; }
+  .color-hint {
+    font-size: 11px;
+    color: var(--ink-soft);
+    margin-top: 8px;
+    line-height: 1.4;
+  }
   .color-swatch {
     width: 28px;
     height: 28px;
@@ -850,6 +1431,7 @@ const CSS = `
   .modal-actions {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 8px;
     margin-top: 20px;
   }
@@ -875,4 +1457,18 @@ const CSS = `
     border: none;
   }
   .danger-btn:hover { text-decoration: underline; }
+  .duplicate-btn {
+    background: transparent;
+    color: var(--ink-soft);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    border: none;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    padding: 9px 4px;
+    margin-left: 8px;
+  }
+  .duplicate-btn:hover { color: var(--ink); text-decoration: underline; }
 `;
