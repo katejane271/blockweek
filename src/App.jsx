@@ -1,5 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
-import { Plus, X, ChevronLeft, ChevronRight, Trash2, Copy, ExternalLink, Download, Upload, RefreshCw } from "lucide-react";
+import { Plus, X, ChevronLeft, ChevronRight, Trash2, Copy, ExternalLink, Download, Upload, RefreshCw, Cloud, CloudOff } from "lucide-react";
+import { fetchCloudData, saveCloudData, supabase } from "./supabaseClient.js";
 
 // ---------- constants ----------
 const DAY_START = 6; // 6am
@@ -227,6 +228,10 @@ export default function App() {
   const [draft, setDraft] = useState(null);
   const [hexText, setHexText] = useState("");
   const [customColors, setCustomColors] = useState(() => loadCustomColors());
+  // 'loading' | 'synced' | 'saving' | 'offline' | 'error'
+  const [syncStatus, setSyncStatus] = useState("loading");
+  const hasLoadedCloud = useRef(false);
+  const saveTimeoutRef = useRef(null);
   // Custom in-app dialog replaces window.confirm/alert, which can silently fail
   // to appear when this app is running as an "Add to Home Screen" standalone app.
   const [dialog, setDialog] = useState(null); // { message, mode: 'confirm' | 'alert', onConfirm }
@@ -242,9 +247,53 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
+  // Pull the latest data from the cloud once when the app first loads, so every
+  // device converges on the same data instead of showing its own stale local copy.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!supabase) {
+        setSyncStatus("offline"); // not configured (e.g. local dev without env vars) - local only
+        hasLoadedCloud.current = true;
+        return;
+      }
+      const cloud = await fetchCloudData();
+      if (cancelled) return;
+      if (cloud) {
+        if (Array.isArray(cloud.blocks)) setBlocks(cloud.blocks);
+        if (Array.isArray(cloud.customColors)) {
+          setCustomColors(cloud.customColors);
+          saveCustomColors(cloud.customColors);
+        }
+        setSyncStatus("synced");
+      } else {
+        // First time ever using this database - push whatever's here now (local/sample data)
+        // up to the cloud so other devices see it too.
+        setSyncStatus("synced");
+        saveCloudData({ blocks, customColors });
+      }
+      hasLoadedCloud.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Save locally instantly (fast, always-available cache), and push to the cloud
+  // a moment after changes settle, so rapid typing doesn't fire a request per keystroke.
   useEffect(() => {
     persistSave(blocks);
-  }, [blocks]);
+    if (!hasLoadedCloud.current || !supabase) return;
+    setSyncStatus("saving");
+    if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+    saveTimeoutRef.current = setTimeout(async () => {
+      const ok = await saveCloudData({ blocks, customColors });
+      setSyncStatus(ok ? "synced" : "error");
+    }, 800);
+    return () => clearTimeout(saveTimeoutRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blocks, customColors]);
 
   const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
   const hours = Array.from(
@@ -610,6 +659,19 @@ export default function App() {
             </button>
           </div>
           <div className="backup-controls">
+            <div className={"sync-status sync-status--" + syncStatus} title={
+              syncStatus === "synced" ? "Synced" :
+              syncStatus === "saving" ? "Saving…" :
+              syncStatus === "loading" ? "Loading…" :
+              syncStatus === "offline" ? "Local only (cloud not configured)" :
+              "Couldn't sync — check your connection"
+            }>
+              {syncStatus === "offline" || syncStatus === "error" ? (
+                <CloudOff size={14} />
+              ) : (
+                <Cloud size={14} className={syncStatus === "saving" || syncStatus === "loading" ? "sync-spin" : ""} />
+              )}
+            </div>
             <button className="nav-btn" onClick={exportBackup} aria-label="Download backup" title="Download backup">
               <Download size={16} />
             </button>
@@ -1051,6 +1113,24 @@ const CSS = `
   }
   .week-nav { display: flex; align-items: center; gap: 6px; }
   .backup-controls { display: flex; align-items: center; gap: 6px; }
+  .sync-status {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    color: var(--ink-soft);
+  }
+  .sync-status--synced { color: #5C6B4F; }
+  .sync-status--error { color: #B5573A; }
+  .sync-status--offline { color: var(--ink-soft); }
+  .sync-spin {
+    animation: sync-spin-anim 1s linear infinite;
+  }
+  @keyframes sync-spin-anim {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
   .nav-btn, .today-btn, .icon-btn {
     background: transparent;
     border: 1px solid var(--paper-line);
